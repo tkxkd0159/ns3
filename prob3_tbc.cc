@@ -32,7 +32,7 @@ main (int argc, char *argv[])
 {
   uint32_t payloadSize = 1472;                       /* Transport layer payload size in bytes. */
   std::string dataRate = "1Mbps";                  /* Application layer datarate. */
-  std::string csmaDataRate = "10Mbps";                  /* Application layer datarate. */
+  std::string csmaDataRate = "10Mbps";                  /* csma channel datarate. */
   std::string phyRate = "HtMcs7";                    /* Physical layer bitrate. */
   double simulationTime = 10;                        /* Simulation time in seconds. */
   bool pcapTracing = true;                          /* PCAP Tracing is enabled or not. */
@@ -40,7 +40,7 @@ main (int argc, char *argv[])
   /* Command line argument parser setup. */
   CommandLine cmd (__FILE__);
   cmd.AddValue ("payloadSize", "Payload size in bytes", payloadSize);
-  cmd.AddValue ("dataRate", "Application data ate", dataRate);
+  cmd.AddValue ("dataRate", "Application data rate", dataRate);
   cmd.AddValue ("phyRate", "Physical layer bitrate", phyRate);
   cmd.AddValue ("simulationTime", "Simulation time in seconds", simulationTime);
   cmd.AddValue ("pcap", "Enable/disable PCAP Tracing", pcapTracing);
@@ -50,6 +50,11 @@ main (int argc, char *argv[])
 
   /* Configure TCP Options */
   Config::SetDefault ("ns3::TcpSocket::SegmentSize", UintegerValue (payloadSize));
+  // disable fragmentation for frames below 2200 bytes
+  Config::SetDefault ("ns3::WifiRemoteStationManager::FragmentationThreshold", StringValue ("2200"));
+  // turn off RTS/CTS for frames below 2200 bytes
+  Config::SetDefault ("ns3::WifiRemoteStationManager::RtsCtsThreshold", StringValue ("2200"));
+
 
   WifiMacHelper wifiMac;
   WifiHelper wifiHelper;
@@ -72,14 +77,13 @@ main (int argc, char *argv[])
   NodeContainer apWifiNode;
   apWifiNode.Create(1);
   NodeContainer csmaNodes;
-  csmaNodes.Add(apWifiNode);
   csmaNodes.Create (2);
 
   CsmaHelper csma;
   csma.SetChannelAttribute ("DataRate", DataRateValue(DataRate(csmaDataRate)));
   csma.SetChannelAttribute ("Delay", TimeValue (NanoSeconds (6560)));
   NetDeviceContainer csmaDevices;
-  csmaDevices = csma.Install (csmaNodes);
+  csmaDevices = csma.Install (NodeContainer(apWifiNode, csmaNodes));
 
 
 
@@ -115,25 +119,29 @@ main (int argc, char *argv[])
   mobility.Install (apWifiNode);
 
   /* Internet stack */
-  InternetStackHelper stack;
-  stack.Install (staWifiNodes);
-  stack.Install (csmaNodes);
-
   OlsrHelper olsr;
-  Ipv4ListRoutingHelper routeList;
-  routeList.Add(olsr, 5);
-  stack.SetRoutingHelper(routeList);
-  /* Populate routing table */
-  Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
+  olsr.ExcludeInterface(apWifiNode.Get(0), 2);
+
+  Ipv4StaticRoutingHelper staticRouting;
+  Ipv4ListRoutingHelper list;
+  list.Add(staticRouting, 0);
+  list.Add(olsr, 10);
+
+  InternetStackHelper internet_olsr;
+  internet_olsr.SetRoutingHelper(list);
+  internet_olsr.Install(staWifiNodes);
+  internet_olsr.Install(apWifiNode);
+  InternetStackHelper internet_csma;
+  internet_csma.Install(csmaNodes);
 
   Ipv4AddressHelper address;
-  address.SetBase ("10.0.1.0", "255.255.255.0");
+  address.SetBase ("10.1.1.0", "255.255.255.0");
   Ipv4InterfaceContainer apInterface;
   apInterface = address.Assign (apDevice);
   Ipv4InterfaceContainer staInterface;
   staInterface = address.Assign (staDevices);
 
-  address.SetBase("10.0.2.0", "255.255.255.0");
+  address.SetBase("172.16.1.0", "255.255.255.0");
   Ipv4InterfaceContainer csmaInterface;
   csmaInterface = address.Assign(csmaDevices);
 
@@ -143,7 +151,7 @@ main (int argc, char *argv[])
   uint16_t sinkPort = 8080;
   PacketSinkHelper sinkHelper ("ns3::TcpSocketFactory", InetSocketAddress (Ipv4Address::GetAny (), sinkPort));
   ApplicationContainer sinkApp = sinkHelper.Install (apWifiNode);
-  ApplicationContainer sinkApp2 = sinkHelper.Install (csmaNodes.Get(2));
+  ApplicationContainer sinkApp2 = sinkHelper.Install (csmaNodes.Get(1));
 
   /* Install TCP/UDP Transmitter on the station */
   OnOffHelper server ("ns3::TcpSocketFactory", (InetSocketAddress (apInterface.GetAddress (0), sinkPort)));
@@ -162,21 +170,44 @@ main (int argc, char *argv[])
   ApplicationContainer sendApp25 = server2.Install (staWifiNodes.Get(1));
 
 
+  Ptr<Ipv4> stack = apWifiNode.Get (0)->GetObject<Ipv4> ();
+  Ptr<Ipv4RoutingProtocol> rp_Gw = (stack->GetRoutingProtocol ());
+  Ptr<Ipv4ListRouting> lrp_Gw = DynamicCast<Ipv4ListRouting> (rp_Gw);
+
+  Ptr<olsr::RoutingProtocol> olsrrp_Gw;
+
+  for (uint32_t i = 0; i < lrp_Gw->GetNRoutingProtocols ();  i++)
+    {
+      int16_t priority;
+      Ptr<Ipv4RoutingProtocol> temp = lrp_Gw->GetRoutingProtocol (i, priority);
+      if (DynamicCast<olsr::RoutingProtocol> (temp))
+        {
+          olsrrp_Gw = DynamicCast<olsr::RoutingProtocol> (temp);
+        }
+    }
+  Ptr<Ipv4StaticRouting> hnaEntries = Create<Ipv4StaticRouting> ();
+  hnaEntries->AddNetworkRouteTo(Ipv4Address("172.16.1.0"), Ipv4Mask("255.255.255.0"), uint32_t (2), uint32_t (1));
+  olsrrp_Gw->SetRoutingTableAssociation(hnaEntries);
 
   /* Start Applications */
   sinkApp.Start (Seconds (0.0));
   sinkApp2.Start (Seconds (0.0));
   sendApp13.Start (Seconds (1.0));
   sendApp25.Start (Seconds (1.0));
+
+  sinkApp.Stop (Seconds (simulationTime + 1));
+  sinkApp2.Stop (Seconds (simulationTime + 1));
+  sendApp13.Stop (Seconds (simulationTime + 1));
+  sendApp25.Stop (Seconds (simulationTime + 1));
   // Simulator::Schedule (Seconds (1.1), &CalculateThroughput);
 
   /* Enable Traces */
   if (pcapTracing)
     {
-      // wifiPhy.SetPcapDataLinkType (WifiPhyHelper::DLT_IEEE802_11);
+      wifiPhy.SetPcapDataLinkType (WifiPhyHelper::DLT_IEEE802_11);
       // wifiPhy.EnablePcap ("AccessPoint", apDevice);
-      // wifiPhy.EnablePcap ("Station", staDevices);
-      csma.EnablePcap ("node5", csmaDevices, true);
+      wifiPhy.EnablePcap ("Station", staDevices);
+      csma.EnablePcap ("node5", csmaDevices.Get(2), true);
     }
 
   /* Start Simulation */
